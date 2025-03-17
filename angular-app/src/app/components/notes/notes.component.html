@@ -1,0 +1,90 @@
+<div class="notes-container">
+  <div class="status-bar">
+    <span>{{ isOnline ? 'Online' : 'Offline' }}</span>
+  </div>
+
+  <h1>Bloco de Notas</h1>
+  
+  <div class="form-container" *ngIf="!selectedNote">
+    <form [formGroup]="noteForm" (ngSubmit)="editingNote ? saveEdit() : addNote()">
+      <div class="form-group">
+        <label for="title">Título</label>
+        <input 
+          type="text" 
+          id="title"
+          formControlName="title" 
+          placeholder="Digite o título da nota"
+        >
+        <div *ngIf="noteForm.get('title')?.invalid && noteForm.get('title')?.touched">
+          <span *ngIf="noteForm.get('title')?.errors?.['required']">O título é obrigatório</span>
+          <span *ngIf="noteForm.get('title')?.errors?.['minlength']">O título deve ter pelo menos 3 caracteres</span>
+        </div>
+      </div>
+      
+      <div class="form-group">
+        <label for="content">Conteúdo</label>
+        <textarea 
+          id="content"
+          formControlName="content" 
+          placeholder="Digite o conteúdo da nota"
+          rows="6"
+        ></textarea>
+        <div *ngIf="noteForm.get('content')?.invalid && noteForm.get('content')?.touched">
+          <span *ngIf="noteForm.get('content')?.errors?.['required']">O conteúdo é obrigatório</span>
+          <span *ngIf="noteForm.get('content')?.errors?.['minlength']">O conteúdo deve ter pelo menos 10 caracteres</span>
+        </div>
+      </div>
+      
+      <div class="button-group">
+        <button type="submit" [disabled]="noteForm.invalid">
+          {{ editingNote ? 'Salvar Alterações' : 'Adicionar Nota' }}
+        </button>
+        <button type="button" *ngIf="editingNote" (click)="cancelEditing()">Cancelar</button>
+      </div>
+    </form>
+  </div>
+  
+  <!-- Visualização de nota -->
+  <div *ngIf="selectedNote" class="note-detail">
+    <div class="note-header">
+      <h2>{{ selectedNote.title }}</h2>
+      <div class="note-actions">
+        <button (click)="startEditing(selectedNote)">Editar</button>
+        <button (click)="closeNote()">Voltar</button>
+      </div>
+    </div>
+    <div class="note-content">
+      <p>{{ selectedNote.content }}</p>
+    </div>
+    <div class="note-footer">
+      <span>Criada em: {{ selectedNote.createdAt | date:'dd/MM/yyyy HH:mm' }}</span>
+      <span>Atualizada em: {{ selectedNote.updatedAt | date:'dd/MM/yyyy HH:mm' }}</span>
+    </div>
+  </div>
+  
+  <div *ngIf="isLoading">
+    <span>Carregando notas...</span>
+  </div>
+  
+  <div *ngIf="!isLoading && !selectedNote" class="notes-list">
+    <div *ngIf="notes.length === 0">
+      <p>Nenhuma nota encontrada. Adicione uma nova!</p>
+    </div>
+    
+    <div *ngFor="let note of notes" class="note-card">
+      <div class="note-card-header" (click)="viewNote(note)">
+        <h3>{{ note.title }}</h3>
+      </div>
+      <div class="note-card-content" (click)="viewNote(note)">
+        <p>{{ note.content.length > 100 ? (note.content | slice:0:100) + '...' : note.content }}</p>
+      </div>
+      <div class="note-card-footer">
+        <span>{{ note.updatedAt | date:'dd/MM/yyyy' }}</span>
+        <div class="note-card-actions">
+          <button (click)="startEditing(note); $event.stopPropagation()">Editar</button>
+          <button (click)="deleteNote(note); $event.stopPropagation()">Excluir</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
