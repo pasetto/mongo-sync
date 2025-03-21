@@ -23,6 +23,7 @@
     "mongodb": ">=4.0.0"
   },
   "dependencies": {
+    "limiter": "^3.0.0",
     "rate-limiter-flexible": "^2.3.8"
   },
   "devDependencies": {

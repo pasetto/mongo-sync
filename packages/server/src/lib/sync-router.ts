@@ -1,95 +1,131 @@
-import { Router } from 'express';
-import { ServerSyncConfig } from './models/sync-config.model';
-import { createSyncMiddleware } from './sync-middleware';
+import express, { Router, Request, Response } from 'express';
+import { Db } from 'mongodb';
+import { cspMiddleware } from './middleware/csp-middleware';
 import { SecurityMiddleware } from './middleware/security-middleware';
-import { createCSPMiddleware } from './middleware/csp-middleware';
+import { SyncMiddleware } from './sync-middleware';
+import { SyncService } from './sync-service';
 import { AuditService } from './services/audit.service';
+import { SyncConfig } from '../types';
+
+// Estendendo o tipo Request apenas para este arquivo
+interface ExtendedRequest extends Request {
+  user?: {
+    id: string;
+    [key: string]: any;
+  }
+}
 
 /**
- * Cria um router Express para endpoints de sincronização
- * com melhorias de performance e segurança
+ * Cria um router Express para as operações de sincronização
  */
-export function createSyncRouter(config: ServerSyncConfig): Router {
-  // Verificar se Router está disponível (Express deve estar instalado)
-  if (!Router) {
-    throw new Error('Express não está instalado. Instale com: npm install express');
-  }
+export function createSyncRouter(config: SyncConfig): Router {
+  const router = express.Router();
+  const db = config.mongodb;
+  const syncService = new SyncService(db, config);
+  const syncMiddleware = new SyncMiddleware(
+    db, 
+    config.authValidator, 
+    config.getUserId,
+    config.userIdField
+  );
   
-  const router = Router();
-  const middleware = createSyncMiddleware(config);
   const securityMiddleware = new SecurityMiddleware();
-  
-  // Middleware de segurança para todos os endpoints
-  router.use(securityMiddleware.rateLimitMiddleware);
-  
-  // Adicionar CSP se não estiver desabilitado
-  if (!config.security?.disableCSP) {
-    router.use(createCSPMiddleware({
-      reportUri: config.security?.cspReportUri
+
+  // Configurar middleware CSP se não desativado
+  const secConfig = config.security as any || {};
+  if (!secConfig.disableCSP) {
+    router.use(cspMiddleware({
+      reportUri: secConfig.cspReportUri
     }));
   }
   
-  // Inicializar serviço de auditoria, se banco de dados estiver disponível
-  let auditService;
-  if (typeof config.mongodb !== 'string') {
-    auditService = new AuditService(config.mongodb);
+  // Configurar auditoria se estiver habilitada
+  let auditService: AuditService | undefined;
+  if (config.security && (config.security as any).audit) {
+    auditService = new AuditService(db, (config.security as any).audit);
   }
-  
-  // Endpoint principal de sincronização
-  router.post('/sync/:collection',
-    middleware.auth,
-    config.security?.csrfProtection !== false ? securityMiddleware.csrfProtection : (req, res, next) => next(),
-    async (req, res) => {
-      const startTime = Date.now();
-      const userId = config.getUserId ? config.getUserId(req) : undefined;
-      const collectionName = req.params.collection;
-      const { lastSyncTimestamp, changedDocs } = req.body;
-      
-      try {
-        const result = await middleware.service.processSync(
-          collectionName,
-          lastSyncTimestamp || 0,
-          changedDocs || [],
-          req
-        );
-        
-        // Registrar operação no serviço de auditoria
-        if (auditService) {
-          const duration = Date.now() - startTime;
-          auditService.logSync({
-            userId: userId || 'anonymous',
-            clientInfo: {
-              ip: req.ip,
-              userAgent: req.headers['user-agent'] || 'unknown'
-            },
-            operation: changedDocs?.length ? 'push' : 'pull',
-            collectionName,
-            docsCount: changedDocs?.length || 0,
-            syncResults: result.syncResults,
-            duration
-          }).catch(err => console.error('Erro ao registrar auditoria:', err));
-        }
-        
-        res.json(result);
-      } catch (error) {
-        res.status(500).json({ error: error.message || 'Erro interno na sincronização' });
+
+  // Middleware de autenticação para todas as rotas
+  router.use(async (req, res, next) => {
+    try {
+      if (req.path === '/status') {
+        return next();
       }
+      await syncMiddleware.authenticate(req, res, next);
+    } catch (error) {
+      console.error('Erro no middleware de autenticação:', error);
+      res.status(401).json({ error: 'Erro de autenticação' });
     }
-  );
+  });
+
+  // Middleware de proteção contra injeção
+  router.use(syncMiddleware.injectionProtection());
   
-  // Endpoint para verificar status
-  router.get('/sync/status', (req, res) => {
-    res.json({
+  // Middleware de rate limiting
+  router.use(syncMiddleware.rateLimit(config.security?.rateLimit || 60));
+
+  // Rota para status
+  router.get('/status', (req, res) => {
+    res.json({ 
       status: 'online',
-      version: require('../../package.json').version,
+      version: '1.0.0',
       timestamp: new Date().toISOString(),
-      features: {
-        securityEnhanced: true,
-        performanceOptimized: true,
-        auditEnabled: !!auditService
-      }
+      auditEnabled: !!auditService
     });
   });
-  
+
+  // Rota para sincronizar uma coleção específica
+  router.post('/sync/:collection', async (req: ExtendedRequest, res: Response) => {
+    try {
+      const startTime = Date.now();
+      const collection = req.params.collection;
+      const changes = req.body;
+      const userId = config.getUserId ? config.getUserId(req) : (req.user?.id || 'anonymous');
+
+      // Registrar atividade no serviço de auditoria
+      if (auditService) {
+        auditService.logEvent({
+          action: `sync_${collection}`,
+          userId,
+          ip: req.ip,
+          userAgent: req.headers['user-agent'] as string,
+          resourceType: collection,
+          details: { changeCount: changes.length }
+        }).catch(err => console.error('Erro ao registrar auditoria:', err));
+      }
+
+      // Executar sincronização
+      const result = await syncService.processChanges(collection, changes, userId);
+      
+      const responseTime = Date.now() - startTime;
+      
+      // Registrar conclusão da sincronização
+      if (auditService) {
+        auditService.logRequest(req, 200, responseTime, true)
+          .catch(err => console.error('Erro ao registrar auditoria:', err));
+      }
+      
+      res.json(result);
+    } catch (error: any) {
+      console.error('Erro na sincronização:', error);
+      res.status(500).json({ error: error.message || 'Erro interno na sincronização' });
+    }
+  });
+
+  // Rota para obter documentos modificados desde determinada data
+  router.get('/changes/:collection', async (req: ExtendedRequest, res: Response) => {
+    try {
+      const collection = req.params.collection;
+      const since = req.query.since ? parseInt(req.query.since as string) : 0;
+      const userId = config.getUserId ? config.getUserId(req) : (req.user?.id || 'anonymous');
+      
+      const changes = await syncService.getChanges(collection, since, userId);
+      res.json(changes);
+    } catch (error: any) {
+      console.error('Erro ao buscar mudanças:', error);
+      res.status(500).json({ error: error.message || 'Erro interno ao buscar mudanças' });
+    }
+  });
+
   return router;
 }

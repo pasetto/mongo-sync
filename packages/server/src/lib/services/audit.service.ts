@@ -1,180 +1,301 @@
-import { Collection, Db } from 'mongodb';
+import { Db } from 'mongodb';
+import { Request } from 'express';
 
+interface AuditOptions {
+  enabled?: boolean;
+  retention?: number; // dias
+  detailedLogging?: boolean;
+  maskSensitiveData?: boolean;
+  sampleRate?: number; // 0-1, porcentagem de requisições para auditar
+}
+
+interface AuditEvent {
+  timestamp: Date;
+  action: string;
+  userId?: string;
+  ip?: string;
+  userAgent?: string;
+  resourceId?: string;
+  resourceType?: string;
+  requestMethod?: string;
+  requestPath?: string;
+  statusCode?: number;
+  responseTime?: number;
+  success: boolean;
+  details?: any;
+  tags?: string[];
+}
+
+/**
+ * Serviço para auditoria de ações e detecção de anomalias
+ */
 export class AuditService {
-  private auditCollection: Collection;
-  
-  constructor(db: Db) {
-    this.auditCollection = db.collection('sync_audit');
-    
-    // Criar índices para consultas eficientes
-    this.auditCollection.createIndex({ timestamp: 1 });
-    this.auditCollection.createIndex({ userId: 1 });
-    this.auditCollection.createIndex({ collectionName: 1 });
-    this.auditCollection.createIndex({ "anomaly.detected": 1 });
-  }
-  
-  /**
-   * Registra uma operação de sincronização
-   */
-  async logSync(data: {
-    userId: string;
-    clientInfo: {
-      ip: string;
-      userAgent: string;
+  private db: Db;
+  private options: AuditOptions;
+  private collection: string = 'audit_logs';
+  private anomalyDetectionEnabled: boolean = true;
+  private baselineMetrics: Map<string, any> = new Map();
+  private lastAnalysisTime: number = 0;
+
+  constructor(db: Db, options: AuditOptions = {}) {
+    this.db = db;
+    this.options = {
+      enabled: true,
+      retention: 90, // 90 dias padrão
+      detailedLogging: false,
+      maskSensitiveData: true,
+      sampleRate: 1.0, // 100% por padrão
+      ...options
     };
-    operation: 'pull' | 'push';
-    collectionName: string;
-    docsCount: number;
-    syncResults: {
-      added: number;
-      updated: number;
-      conflicts: number;
-    };
-    duration: number;
-  }): Promise<void> {
-    const timestamp = Date.now();
     
-    // Detectar anomalias
-    const anomaly = await this.detectAnomalies({
-      ...data,
-      timestamp
-    });
-    
-    // Salvar registro de auditoria
-    await this.auditCollection.insertOne({
-      ...data,
-      timestamp,
-      anomaly
-    });
+    // Inicializar processamento em background
+    this.initBackgroundTasks();
   }
-  
+
   /**
-   * Detecta padrões suspeitos na sincronização
+   * Registrar evento de auditoria
    */
-  private async detectAnomalies(data: any): Promise<{ 
-    detected: boolean;
-    reasons: string[];
-    severity: 'low' | 'medium' | 'high';
-  }> {
-    const reasons: string[] = [];
+  async logEvent(event: Partial<AuditEvent>): Promise<void> {
+    if (!this.options.enabled) return;
     
-    // 1. Volume anormalmente alto
-    const hourAgo = Date.now() - 3600000;
-    const recentSyncs = await this.auditCollection.countDocuments({
-      userId: data.userId,
-      timestamp: { $gt: hourAgo }
-    });
+    // Aplicar amostragem (sample rate)
+    if (Math.random() > (this.options.sampleRate || 1.0)) return;
     
-    if (recentSyncs > 120) { // Mais de 2 sincronizações por minuto
-      reasons.push('Excesso de sincronizações');
-    }
-    
-    // 2. Tamanho anormal de operações
-    if (data.docsCount > 1000) {
-      reasons.push('Volume anormalmente alto de documentos');
-    }
-    
-    // 3. Padrão de tempo suspeito (síncronizações muitas em intervalos exatos)
-    const lastFiveSyncs = await this.auditCollection
-      .find({ userId: data.userId })
-      .sort({ timestamp: -1 })
-      .limit(5)
-      .toArray();
-    
-    if (lastFiveSyncs.length >= 5) {
-      const intervals = [];
-      for (let i = 0; i < lastFiveSyncs.length - 1; i++) {
-        intervals.push(lastFiveSyncs[i].timestamp - lastFiveSyncs[i+1].timestamp);
+    try {
+      const auditEvent: AuditEvent = {
+        timestamp: new Date(),
+        action: event.action || 'unknown',
+        success: event.success !== undefined ? event.success : true,
+        ...event
+      };
+      
+      // Mascarar dados sensíveis se configurado
+      if (this.options.maskSensitiveData && auditEvent.details) {
+        auditEvent.details = this.maskSensitiveData(auditEvent.details);
       }
       
-      // Verificar se os intervalos são consistentes (possível bot)
-      const avgInterval = intervals.reduce((sum, val) => sum + val, 0) / intervals.length;
-      const allSimilar = intervals.every(interval => 
-        Math.abs(interval - avgInterval) < avgInterval * 0.1
-      );
+      // Inserir no banco de dados
+      await this.db.collection(this.collection).insertOne(auditEvent);
       
-      if (allSimilar) {
-        reasons.push('Padrão de tempo suspeito (possível automação)');
+      // Atualizar métricas para detecção de anomalias
+      this.updateAnomalyMetrics(auditEvent);
+    } catch (error) {
+      console.error('Erro ao registrar evento de auditoria:', error);
+    }
+  }
+
+  /**
+   * Registrar evento a partir de uma requisição HTTP
+   */
+  async logRequest(req: Request, statusCode: number, responseTime: number, success: boolean): Promise<void> {
+    const userId = req.user?.id;
+    const path = req.path;
+    const method = req.method;
+    
+    await this.logEvent({
+      action: `${method} ${path}`,
+      userId,
+      ip: req.ip,
+      userAgent: req.headers['user-agent'] as string,
+      requestMethod: method,
+      requestPath: path,
+      statusCode,
+      responseTime,
+      success,
+      details: this.options.detailedLogging ? {
+        query: req.query,
+        params: req.params
+        // Não logar body por segurança
+      } : undefined
+    });
+  }
+
+  /**
+   * Detectar padrões suspeitos em atividades
+   */
+  async detectAnomalies(): Promise<any[]> {
+    if (!this.anomalyDetectionEnabled) return [];
+    
+    try {
+      const anomalies = [];
+      const now = new Date();
+      const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
+      
+      // Analisar tentativas de login com falha por IP
+      const failedLogins = await this.db.collection(this.collection).aggregate([
+        {
+          $match: {
+            action: 'login',
+            success: false,
+            timestamp: { $gte: oneHourAgo }
+          }
+        },
+        {
+          $group: {
+            _id: '$ip',
+            count: { $sum: 1 }
+          }
+        },
+        {
+          $match: {
+            count: { $gt: 5 } // Mais de 5 falhas em 1 hora
+          }
+        }
+      ]).toArray();
+      
+      // Identificar IPs com muitas requisições
+      const ipCounts: Record<string, number> = {};
+      const highTraffic = await this.db.collection(this.collection).find({
+        timestamp: { $gte: oneHourAgo }
+      }).toArray();
+      
+      highTraffic.forEach(log => {
+        const ip = log.ip;
+        if (ip) {
+          ipCounts[ip] = (ipCounts[ip] || 0) + 1;
+        }
+      });
+      
+      // Verificar IPs com tráfego anormalmente alto
+      const avgRequestCount = Object.values(ipCounts).reduce((sum, count) => sum + count, 0) / 
+                             (Object.keys(ipCounts).length || 1);
+      
+      for (const [ip, count] of Object.entries(ipCounts)) {
+        // IP com mais de 3x a média de requisições
+        if (count > avgRequestCount * 3 && count > 100) {
+          anomalies.push({
+            type: 'high_traffic',
+            ip,
+            count,
+            avgCount: avgRequestCount,
+            timestamp: now
+          });
+        }
+      }
+      
+      // Adicionar anomalias de login
+      failedLogins.forEach(item => {
+        anomalies.push({
+          type: 'failed_login',
+          ip: item._id,
+          count: item.count,
+          timestamp: now
+        });
+      });
+      
+      return anomalies;
+    } catch (error) {
+      console.error('Erro ao detectar anomalias:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Mascarar dados sensíveis em objetos
+   */
+  private maskSensitiveData(data: any): any {
+    if (!data) return data;
+    
+    // Lista de campos sensíveis para mascarar
+    const sensitiveFields = [
+      'password', 'senha', 'token', 'apiKey', 'secret', 'credit_card',
+      'ssn', 'social', 'card', 'cartao', 'cvv', 'cvc'
+    ];
+    
+    // Função recursiva para mascarar campos sensíveis
+    const mask = (obj: any): any => {
+      if (typeof obj !== 'object' || obj === null) {
+        return obj;
+      }
+      
+      if (Array.isArray(obj)) {
+        return obj.map(item => mask(item));
+      }
+      
+      const result: any = {};
+      
+      for (const [key, value] of Object.entries(obj)) {
+        if (sensitiveFields.some(field => key.toLowerCase().includes(field))) {
+          result[key] = '******';
+        } else if (typeof value === 'object' && value !== null) {
+          result[key] = mask(value);
+        } else {
+          result[key] = value;
+        }
+      }
+      
+      return result;
+    };
+    
+    return mask(data);
+  }
+
+  /**
+   * Atualizar métricas para detecção de anomalias
+   */
+  private updateAnomalyMetrics(event: AuditEvent): void {
+    if (!event.ip || !event.action) return;
+    
+    const key = `${event.ip}:${event.action}`;
+    let metric = this.baselineMetrics.get(key);
+    
+    if (!metric) {
+      metric = {
+        count: 1,
+        firstSeen: Date.now(),
+        lastSeen: Date.now(),
+        responseTimes: [event.responseTime],
+        successCount: event.success ? 1 : 0,
+        failureCount: event.success ? 0 : 1
+      };
+    } else {
+      metric.count++;
+      metric.lastSeen = Date.now();
+      if (event.responseTime) metric.responseTimes.push(event.responseTime);
+      if (event.success) metric.successCount++;
+      else metric.failureCount++;
+      
+      // Limitar o tamanho do array de tempos de resposta
+      if (metric.responseTimes.length > 100) {
+        metric.responseTimes.shift();
       }
     }
     
-    // 4. Acesso de IPs incomuns
-    const unusualAccess = await this.detectUnusualAccess(data.userId, data.clientInfo.ip);
-    if (unusualAccess) {
-      reasons.push('Acesso de localização incomum');
-    }
-    
-    // Determinar severidade
-    let severity: 'low' | 'medium' | 'high' = 'low';
-    if (reasons.length >= 3) {
-      severity = 'high';
-    } else if (reasons.length >= 1) {
-      severity = 'medium';
-    }
-    
-    return {
-      detected: reasons.length > 0,
-      reasons,
-      severity
-    };
+    this.baselineMetrics.set(key, metric);
   }
-  
+
   /**
-   * Detecta acesso de IP incomum para um usuário
+   * Inicializar tarefas em background
    */
-  private async detectUnusualAccess(userId: string, currentIp: string): Promise<boolean> {
-    // Buscar IPs recentes deste usuário
-    const twoWeeksAgo = Date.now() - (14 * 24 * 3600000);
-    const recentAccess = await this.auditCollection
-      .find({ 
-        userId, 
-        timestamp: { $gt: twoWeeksAgo },
-        "clientInfo.ip": { $exists: true }
-      })
-      .project({ "clientInfo.ip": 1 })
-      .toArray();
+  private initBackgroundTasks(): void {
+    // Executar limpeza de logs antigos diariamente
+    setInterval(async () => {
+      try {
+        const cutoffDate = new Date();
+        cutoffDate.setDate(cutoffDate.getDate() - (this.options.retention || 90));
+        
+        await this.db.collection(this.collection).deleteMany({
+          timestamp: { $lt: cutoffDate }
+        });
+      } catch (error) {
+        console.error('Erro ao limpar logs antigos:', error);
+      }
+    }, 24 * 60 * 60 * 1000); // 24 horas
     
-    // Se houver poucos registros, não há como determinar um padrão
-    if (recentAccess.length < 5) return false;
-    
-    // Contar ocorrências de cada IP
-    const ipCounts = {};
-    recentAccess.forEach(access => {
-      const ip = access.clientInfo.ip;
-      ipCounts[ip] = (ipCounts[ip] || 0) + 1;
-    });
-    
-    // Verificar se IP atual é incomum
-    const totalAccess = recentAccess.length;
-    const currentIpCount = ipCounts[currentIp] || 0;
-    
-    // Se este IP representa menos de 10% dos acessos recentes
-    return (currentIpCount / totalAccess) < 0.1;
-  }
-  
-  /**
-   * Lista anomalias recentes
-   */
-  async getRecentAnomalies(options: {
-    since?: number;
-    severity?: 'low' | 'medium' | 'high';
-    limit?: number;
-  } = {}): Promise<any[]> {
-    const { since = Date.now() - (24 * 3600000), severity, limit = 100 } = options;
-    
-    const query: any = {
-      timestamp: { $gt: since },
-      "anomaly.detected": true
-    };
-    
-    if (severity) {
-      query["anomaly.severity"] = severity;
-    }
-    
-    return this.auditCollection
-      .find(query)
-      .sort({ timestamp: -1 })
-      .limit(limit)
-      .toArray();
+    // Executar detecção de anomalias a cada hora
+    setInterval(async () => {
+      try {
+        const anomalies = await this.detectAnomalies();
+        
+        if (anomalies.length > 0) {
+          console.warn(`Detected ${anomalies.length} security anomalies`);
+          
+          // Registrar anomalias detectadas
+          await this.db.collection('security_anomalies').insertMany(anomalies);
+        }
+      } catch (error) {
+        console.error('Erro na detecção de anomalias:', error);
+      }
+    }, 60 * 60 * 1000); // 1 hora
   }
 }

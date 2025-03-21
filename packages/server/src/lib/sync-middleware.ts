@@ -1,120 +1,165 @@
-import { ServerSyncConfig } from './models/sync-config.model';
-import { SyncService } from './sync-service';
-
-// Interface para Express.Request
-interface Request {
-  body: any;
-  params: any;
-  query: any;
-  headers: any;
-  [key: string]: any;
-}
-
-// Interface para Express.Response
-interface Response {
-  json: (body: any) => void;
-  status: (code: number) => Response;
-  send: (body: any) => void;
-  [key: string]: any;
-}
-
-// Interface para Express.NextFunction
-type NextFunction = (error?: any) => void;
+import { Request, Response, NextFunction } from 'express';
+import { Db } from 'mongodb';
+import { securityMiddleware } from './middleware/security-middleware';
 
 /**
- * Cria middleware de sincronização para Express
+ * Middleware para validação de requisições de sincronização
  */
-export function createSyncMiddleware(config: ServerSyncConfig) {
-  const syncService = new SyncService(config);
-  let rateLimits: {[key: string]: {count: number, resetTime: number}} = {};
-  
-  // Inicializar serviço
-  syncService.initialize().catch(err => {
-    console.error('Erro ao inicializar serviço de sincronização:', err);
-  });
-  
-  // Middleware de autenticação
-  const authMiddleware = async (req: Request, res: Response, next: NextFunction) => {
-    if (!config.authValidator) {
-      return next();
-    }
-    
+export class SyncMiddleware {
+  private db: Db;
+  private authValidator: (req: Request) => boolean | Promise<boolean>;
+  private getUserId: (req: Request) => string;
+  private userIdField: string;
+
+  constructor(
+    db: Db, 
+    authValidator: (req: Request) => boolean | Promise<boolean> = () => true,
+    getUserId: (req: Request) => string = (req) => req.user?.id || 'anonymous',
+    userIdField: string = 'userId'
+  ) {
+    this.db = db;
+    this.authValidator = authValidator;
+    this.getUserId = getUserId;
+    this.userIdField = userIdField;
+  }
+
+  /**
+   * Middleware para autenticação de requisições
+   */
+  async authenticate(req: Request, res: Response, next: NextFunction) {
     try {
-      const isAuthenticated = await config.authValidator(req);
-      if (isAuthenticated) {
+      const isAuthenticated = await this.authValidator(req);
+      
+      if (!isAuthenticated) {
+        return res.status(401).json({
+          error: 'Não autorizado',
+          requiresAuth: true
+        });
+      }
+      
+      next();
+    } catch (error: any) {
+      console.error('Erro de autenticação:', error);
+      res.status(401).json({
+        error: 'Erro na autenticação',
+        requiresAuth: true
+      });
+    }
+  }
+
+  /**
+   * Middleware para garantir que o usuário só acesse seus próprios dados
+   */
+  async dataOwnershipValidator(collection: string, validator?: (doc: any, req: Request) => boolean | Promise<boolean>) {
+    return async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const userId = this.getUserId(req);
+        const docId = req.params.id;
+        
+        if (!docId) {
+          return next();
+        }
+        
+        // Buscar o documento
+        const doc = await this.db.collection(collection).findOne({ id: docId });
+        
+        if (!doc) {
+          return res.status(404).json({ error: 'Documento não encontrado' });
+        }
+        
+        // Verificar se o documento pertence ao usuário
+        const isOwner = doc[this.userIdField] && doc[this.userIdField].toString() === userId;
+        
+        // Se houver um validador customizado, usá-lo também
+        if (validator && !await validator(doc, req)) {
+          return res.status(403).json({ error: 'Acesso negado ao documento' });
+        }
+        
+        if (!isOwner) {
+          return res.status(403).json({ error: 'O documento não pertence a este usuário' });
+        }
+        
         next();
-      } else {
-        res.status(401).json({ error: 'Não autorizado' });
+      } catch (error: any) {
+        console.error('Erro na validação de propriedade:', error);
+        res.status(500).json({ error: error.message || 'Erro interno na sincronização' });
       }
-    } catch (error) {
-      res.status(500).json({ error: 'Erro na autenticação' });
-    }
-  };
-  
-  // Middleware de limite de taxa
-  const rateLimitMiddleware = (req: Request, res: Response, next: NextFunction) => {
-    if (!config.security?.rateLimit) {
-      return next();
-    }
-    
-    const clientId = req.ip || 'unknown';
-    const now = Date.now();
-    
-    if (!rateLimits[clientId]) {
-      rateLimits[clientId] = {
-        count: 1,
-        resetTime: now + 60000 // 1 minuto
-      };
-      return next();
-    }
-    
-    const limit = rateLimits[clientId];
-    
-    // Resetar contador se o tempo expirou
-    if (now > limit.resetTime) {
-      limit.count = 1;
-      limit.resetTime = now + 60000;
-      return next();
-    }
-    
-    // Verificar limite
-    if (limit.count >= config.security.rateLimit) {
-      return res.status(429).json({ error: 'Limite de requisições excedido' });
-    }
-    
-    // Incrementar contador
-    limit.count++;
-    next();
-  };
-  
-  // Middleware principal de sincronização
-  const syncMiddleware = async (req: Request, res: Response) => {
-    try {
-      const collectionName = req.params.collection;
-      const { lastSyncTimestamp, changedDocs } = req.body;
-      
-      if (!collectionName) {
-        return res.status(400).json({ error: 'Nome da coleção não especificado' });
+    };
+  }
+
+  /**
+   * Middleware para validação de documentos antes da inserção/atualização
+   */
+  documentValidator(validator: (doc: any, req: Request) => boolean | Promise<boolean>) {
+    return async (req: Request, res: Response, next: NextFunction) => {
+      try {
+        const doc = req.body;
+        
+        if (!doc) {
+          return res.status(400).json({ error: 'Documento não fornecido' });
+        }
+        
+        // Executar validação
+        const isValid = await validator(doc, req);
+        
+        if (!isValid) {
+          return res.status(400).json({ error: 'Documento inválido' });
+        }
+        
+        next();
+      } catch (error) {
+        console.error('Erro na validação de documento:', error);
+        res.status(400).json({ error: 'Erro na validação de documento' });
       }
-      
-      const result = await syncService.processSync(
-        collectionName,
-        lastSyncTimestamp || 0,
-        changedDocs || [],
-        req
-      );
-      
-      res.json(result);
-    } catch (error) {
-      res.status(500).json({ error: error.message || 'Erro interno na sincronização' });
-    }
-  };
+    };
+  }
+
+  /**
+   * Middleware para rate limiting
+   */
+  rateLimit(limit: number = 60) {
+    return securityMiddleware.rateLimit(limit);
+  }
+
+  /**
+   * Middleware para proteção contra injeção
+   */
+  injectionProtection() {
+    return securityMiddleware.injectionProtection();
+  }
+
+  /**
+   * Middleware para inserir userId nos documentos criados
+   */
+  addUserIdToDocument() {
+    return (req: Request, res: Response, next: NextFunction) => {
+      if (req.body && req.method === 'POST') {
+        const userId = this.getUserId(req);
+        req.body[this.userIdField] = userId;
+      }
+      next();
+    };
+  }
   
-  // Retornar objeto com os middlewares
-  return {
-    auth: authMiddleware,
-    rateLimit: rateLimitMiddleware,
-    sync: syncMiddleware,
-    service: syncService
-  };
+  /**
+   * Middleware para adicionar campos de auditoria aos documentos
+   */
+  addAuditFields() {
+    return (req: Request, res: Response, next: NextFunction) => {
+      if (req.body) {
+        const now = Date.now();
+        
+        // Para novos documentos
+        if (req.method === 'POST') {
+          req.body.createdAt = req.body.createdAt || now;
+          req.body.updatedAt = now;
+        }
+        // Para atualizações
+        else if (req.method === 'PUT' || req.method === 'PATCH') {
+          req.body.updatedAt = now;
+        }
+      }
+      next();
+    };
+  }
 }

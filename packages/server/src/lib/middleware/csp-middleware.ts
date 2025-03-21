@@ -1,53 +1,64 @@
 import { Request, Response, NextFunction } from 'express';
+import * as cryptoNode from 'crypto';
 
-export function createCSPMiddleware(options: {
-  reportOnly?: boolean;
+interface CSPOptions {
   reportUri?: string;
-} = {}) {
+}
+
+interface CSPDirectives {
+  'default-src': string[];
+  'script-src': string[];
+  'style-src': string[];
+  'img-src': string[];
+  'font-src': string[];
+  'connect-src': string[];
+  'worker-src': string[];
+  'frame-ancestors': string[];
+  'form-action': string[];
+  'base-uri': string[];
+  'object-src': string[];
+  'report-uri'?: string[];
+  [key: string]: string[] | undefined;
+}
+
+/**
+ * Middleware para configurar Content Security Policy (CSP)
+ */
+export function cspMiddleware(options: CSPOptions = {}) {
   return (req: Request, res: Response, next: NextFunction) => {
-    // Definir política CSP para prevenir XSS e outros ataques
-    const directives = {
+    // Configurar diretivas CSP
+    const directives: CSPDirectives = {
       'default-src': ["'self'"],
-      'script-src': ["'self'", "'strict-dynamic'", "'nonce-{nonce}'"],
+      'script-src': ["'self'", "'unsafe-inline'"],
       'style-src': ["'self'", "'unsafe-inline'"],
-      'img-src': ["'self'", 'data:', 'blob:'],
+      'img-src': ["'self'", 'data:'],
       'font-src': ["'self'"],
-      'connect-src': ["'self'", req.hostname],
-      'worker-src': ["'self'", 'blob:'],
-      'frame-ancestors': ["'none'"],
+      'connect-src': ["'self'"],
+      'worker-src': ["'self'"],
+      'frame-ancestors': ["'self'"],
       'form-action': ["'self'"],
       'base-uri': ["'self'"],
-      'object-src': ["'none'"],
+      'object-src': ["'none'"]
     };
 
-    // Adicionar report-uri se configurado
+    // Adicionar URI de relatório, se fornecida
     if (options.reportUri) {
       directives['report-uri'] = [options.reportUri];
     }
 
     // Gerar nonce para scripts
-    const nonce = Buffer.from(crypto.randomBytes(16)).toString('base64');
-    
-    // Substituir placeholder {nonce} por nonce real
-    directives['script-src'] = directives['script-src'].map(
-      src => src.replace('{nonce}', nonce)
-    );
+    const nonce = Buffer.from(cryptoNode.randomBytes(16)).toString('base64');
+    directives['script-src'].push(`'nonce-${nonce}'`);
 
     // Construir cabeçalho CSP
-    const cspValue = Object.entries(directives)
-      .map(([key, values]) => `${key} ${values.join(' ')}`)
+    const cspHeader = Object.entries(directives)
+      .map(([key, values]) => `${key} ${(values || ['']).join(' ')}`)
       .join('; ');
 
-    // Definir cabeçalho CSP
-    const headerName = options.reportOnly ? 
-      'Content-Security-Policy-Report-Only' : 
-      'Content-Security-Policy';
-    
-    res.setHeader(headerName, cspValue);
-    
-    // Disponibilizar nonce para uso nos templates
+    // Definir cabeçalhos
+    res.setHeader('Content-Security-Policy', cspHeader);
     res.locals.cspNonce = nonce;
-    
+
     next();
   };
 }

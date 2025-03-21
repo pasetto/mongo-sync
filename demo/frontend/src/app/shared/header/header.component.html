@@ -1,0 +1,22 @@
+<mat-toolbar color="primary">
+    <span>Todo App</span>
+    <span class="spacer"></span>
+    
+    <ng-container *ngIf="currentUser$ | async as user; else loginButtons">
+      <span>{{ user.email }}</span>
+      <button mat-icon-button [matMenuTriggerFor]="menu">
+        <mat-icon>account_circle</mat-icon>
+      </button>
+      <mat-menu #menu="matMenu">
+        <button mat-menu-item (click)="logout()">
+          <mat-icon>exit_to_app</mat-icon>
+          <span>Sair</span>
+        </button>
+      </mat-menu>
+    </ng-container>
+    
+    <ng-template #loginButtons>
+      <button mat-button routerLink="/login">Login</button>
+      <button mat-button routerLink="/register">Registrar</button>
+    </ng-template>
+  </mat-toolbar>

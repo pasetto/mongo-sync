@@ -1,0 +1,64 @@
+<div class="todo-container">
+    <mat-card>
+      <mat-card-header>
+        <mat-card-title>Minhas Tarefas</mat-card-title>
+      </mat-card-header>
+      
+      <mat-card-content>
+        <div class="add-todo-form">
+          <mat-form-field appearance="outline" class="full-width">
+            <mat-label>Nova Tarefa</mat-label>
+            <input 
+              matInput 
+              [(ngModel)]="newTodoText" 
+              placeholder="O que precisa ser feito?"
+              (keyup.enter)="addTodo()">
+            <button 
+              mat-icon-button 
+              matSuffix 
+              color="primary" 
+              (click)="addTodo()"
+              [disabled]="!newTodoText.trim()">
+              <mat-icon>add</mat-icon>
+            </button>
+          </mat-form-field>
+        </div>
+        
+        <div *ngIf="loading" class="spinner-container">
+          <mat-spinner diameter="40"></mat-spinner>
+        </div>
+        
+        <mat-list *ngIf="!loading && todos.length > 0">
+          <div *ngFor="let todo of todos" class="todo-item">
+            <mat-checkbox 
+              [checked]="todo.done"
+              (change)="toggleTodoStatus(todo)"
+              color="primary">
+            </mat-checkbox>
+            
+            <span 
+              class="todo-text" 
+              [class.completed]="todo.done"
+              (dblclick)="todoText.focus(); todoText.select();">
+              <input 
+                #todoText
+                [value]="todo.text"
+                (blur)="editTodo(todo, todoText.value)"
+                (keyup.enter)="editTodo(todo, todoText.value); todoText.blur()">
+            </span>
+            
+            <button 
+              mat-icon-button 
+              color="warn" 
+              (click)="deleteTodo(todo)">
+              <mat-icon>delete</mat-icon>
+            </button>
+          </div>
+        </mat-list>
+        
+        <div *ngIf="!loading && todos.length === 0" class="empty-list">
+          <p>Nenhuma tarefa encontrada. Adicione uma nova usando o campo acima.</p>
+        </div>
+      </mat-card-content>
+    </mat-card>
+  </div>
